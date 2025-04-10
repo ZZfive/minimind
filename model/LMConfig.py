@@ -2,15 +2,15 @@ from transformers import PretrainedConfig
 from typing import List
 
 
-class LMConfig(PretrainedConfig):
-    model_type = "minimind"
+class LMConfig(PretrainedConfig):  # PretrainedConfig是transformers提供的一个用于存储和管理云训练模型配置的基类
+    model_type = "minimind"  # 通过model_type表示模型架构类型
 
     def __init__(
             self,
             dim: int = 512,
             n_layers: int = 8,
             n_heads: int = 8,
-            n_kv_heads: int = 2,
+            n_kv_heads: int = 2,  # GQA中一个组中包含的head数量
             vocab_size: int = 6400,
             hidden_dim: int = None,
             multiple_of: int = 64,
@@ -23,11 +23,11 @@ class LMConfig(PretrainedConfig):
             # Here are the specific configurations of MOE
             # When use_moe is false, the following is invalid
             ####################################################
-            use_moe: bool = False,
+            use_moe: bool = False,  # 是否使用MOE架构
             ####################################################
-            num_experts_per_tok: int = 2,
-            n_routed_experts: int = 4,
-            n_shared_experts: bool = True,
+            num_experts_per_tok: int = 2,  # 每个token选择的专家数量
+            n_routed_experts: int = 4,  # 路由专家数量
+            n_shared_experts: bool = True,  # 是否使用共享专家
             scoring_func: str = 'softmax',
             aux_loss_alpha: float = 0.1,
             seq_aux: bool = True,
