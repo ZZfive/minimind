@@ -20,30 +20,30 @@ class LoRA(nn.Module):
 
 def apply_lora(model, rank=16):
     for name, module in model.named_modules():
-        if isinstance(module, nn.Linear) and module.weight.shape[0] == module.weight.shape[1]:
+        if isinstance(module, nn.Linear) and module.weight.shape[0] == module.weight.shape[1]:  # 对模型架构中输入、输出尺寸相等的线形成设置Lora，相当于只对自注意力模块中的转换矩阵进行LoRA处理
             lora = LoRA(module.weight.shape[0], module.weight.shape[1], rank=rank).to(model.device)
-            setattr(module, "lora", lora)
+            setattr(module, "lora", lora)  # 将LoRA模块设置为module的属性
             original_forward = module.forward
 
             # 显式绑定
             def forward_with_lora(x, layer1=original_forward, layer2=lora):
-                return layer1(x) + layer2(x)
+                return layer1(x) + layer2(x)  # 将原始模块的输出与LoRA模块的输出相加
 
-            module.forward = forward_with_lora
+            module.forward = forward_with_lora  # 将新的forward方法设置为module的forward方法
 
 
 def load_lora(model, path):
-    state_dict = torch.load(path, map_location=model.device)
+    state_dict = torch.load(path, map_location=model.device)  # 从指定路径加载Lora模型参数
     for name, module in model.named_modules():
-        if hasattr(module, 'lora'):
+        if hasattr(module, 'lora'):  # 检查module是否具有lora属性
             lora_state = {k.replace(f'{name}.lora.', ''): v for k, v in state_dict.items() if f'{name}.lora.' in k}
-            module.lora.load_state_dict(lora_state)
+            module.lora.load_state_dict(lora_state)  # 将Lora模型参数加载到module的lora属性中
 
 
 def save_lora(model, path):
     state_dict = {}
     for name, module in model.named_modules():
-        if hasattr(module, 'lora'):
+        if hasattr(module, 'lora'):  # 检查module是否具有lora属性
             lora_state = {f'{name}.lora.{k}': v for k, v in module.lora.state_dict().items()}
             state_dict.update(lora_state)
-    torch.save(state_dict, path)
+    torch.save(state_dict, path)  # 将state_dict保存到指定路径
