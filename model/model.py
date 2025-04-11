@@ -223,11 +223,11 @@ class MOEFeedForward(nn.Module):
         orig_shape = x.shape
         bsz, seq_len, _ = x.shape
         # 使用门控机制选择专家
-        topk_idx, topk_weight, aux_loss = self.gate(x)  # 返回每个token选择的路由专家索引、权重和辅助损失；前两个对象的shape为[bsz*seq_len, n_routed_experts]
+        topk_idx, topk_weight, aux_loss = self.gate(x)  # 返回每个token选择的路由专家索引、权重和辅助损失；topk_idx的shape为[bsz*seq_len, topk]
         x = x.view(-1, x.shape[-1])  # [bsz*seq_len, dim]
-        flat_topk_idx = topk_idx.view(-1)  # [bsz*seq_len, n_routed_experts]
+        flat_topk_idx = topk_idx.view(-1)  # [bsz*seq_len*topk]
         if self.training:
-            x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)  # 重复每个token的输入，以便每个token都能被路由到多个专家，[bsz*seq_len*num_experts_per_tok, dim]
+            x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)  # 重复每个token的输入，以便每个token都能被路由到多个专家，[bsz*seq_len*topk, dim]
             y = torch.empty_like(x, dtype=torch.float16)  # 创建一个与x形状相同，数据类型为float16的空张量
             for i, expert in enumerate(self.experts):
                 y[flat_topk_idx == i] = expert(x[flat_topk_idx == i]).to(y.dtype)  # 只处理路由到该专家的token
@@ -243,9 +243,9 @@ class MOEFeedForward(nn.Module):
     @torch.no_grad()
     def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
         expert_cache = torch.zeros_like(x)
-        idxs = flat_expert_indices.argsort()  # 对专家索引进行排序
-        tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)  # 计算每个专家处理的token数量
-        token_idxs = idxs // self.config.num_experts_per_tok  # 计算每个token属于哪个专家
+        idxs = flat_expert_indices.argsort()  # 对每个token对应的专家的索引值按升序排序，返回的是专家索引值列表的索引
+        tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)  # 计算每个专家索引出现的次数，相当于路由到每个专家的token数量
+        token_idxs = idxs // self.config.num_experts_per_tok  # 因为flat_expert_indices中包含了每个token对应的topk的专家索引后完全拉平，要除以topk才是每个专家对应的token的索引
         # 当tokens_per_expert = [6, 15, 20, 26]，tokens_per_expert.shape[0]即为专家数量（此时为4）
         # 且token_idxs = [3, 7, 19, 21, 24, 25,  4,  5,  6, 10, 11, 12...] 时
         # 意味token_idxs[:6] -> [3, 7, 19, 21, 24, 25]这6个位置属于专家0处理的token（每个token有可能被多个专家处理，这取决于num_experts_per_tok）
@@ -254,12 +254,12 @@ class MOEFeedForward(nn.Module):
             start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
             if start_idx == end_idx:
                 continue
-            expert = self.experts[i]
-            exp_token_idx = token_idxs[start_idx:end_idx]
-            expert_tokens = x[exp_token_idx]
-            expert_out = expert(expert_tokens).to(expert_cache.dtype)
-            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
-            expert_cache.scatter_add_(0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out)
+            expert = self.experts[i]  # 获取第i个专家
+            exp_token_idx = token_idxs[start_idx:end_idx]  # 获取属于第i个专家的token索引
+            expert_tokens = x[exp_token_idx]  # 获取属于第i个专家的token
+            expert_out = expert(expert_tokens).to(expert_cache.dtype)  # 计算专家的输出
+            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])  # 将专家的输出乘以权重
+            expert_cache.scatter_add_(0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out)  # 将专家的输出添加到expert_cache中
 
         return expert_cache
 
@@ -275,7 +275,7 @@ class MiniMindBlock(nn.Module):
         self.layer_id = layer_id
         self.attention_norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.ffn_norm = RMSNorm(config.dim, eps=config.norm_eps)
-        self.feed_forward = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
+        self.feed_forward = FeedForward(config) if not config.use_moe else MOEFeedForward(config)  # 如果use_moe为True，则使用MOEFeedForward，否则使用FeedForward
 
     def forward(self, x, pos_cis, past_key_value=None, use_cache=False):
         h_attn, past_kv = self.attention(
@@ -296,12 +296,12 @@ class MiniMindLM(PreTrainedModel):
         self.params = params or LMConfig()
         super().__init__(self.params)
         self.vocab_size, self.n_layers = params.vocab_size, params.n_layers
-        self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
+        self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)  # 词嵌入层
         self.dropout = nn.Dropout(params.dropout)
         self.layers = nn.ModuleList([MiniMindBlock(l, params) for l in range(self.n_layers)])
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
-        self.tok_embeddings.weight = self.output.weight
+        self.tok_embeddings.weight = self.output.weight  # 将词嵌入层的权重与输出层的权重共享；线性层的weight的shape与定义时的shape刚好转置，故两者的shape都是[vocab_size, dim]，即可以共享
         self.register_buffer("pos_cis",
                              precompute_pos_cis(dim=params.dim // params.n_heads, theta=params.rope_theta),
                              persistent=False)
@@ -313,26 +313,26 @@ class MiniMindLM(PreTrainedModel):
                 use_cache: bool = False,
                 logits_to_keep: Union[int, torch.Tensor] = 0,
                 **args):
-        past_key_values = past_key_values or [None] * len(self.layers)
+        past_key_values = past_key_values or [None] * len(self.layers)  # KV Cache
         start_pos = args.get('start_pos', 0)
-        h = self.dropout(self.tok_embeddings(input_ids))
-        pos_cis = self.pos_cis[start_pos:start_pos + input_ids.size(1)]
+        h = self.dropout(self.tok_embeddings(input_ids))  # [bsz, seq_len] ->[bsz, seq_len, dim]
+        pos_cis = self.pos_cis[start_pos:start_pos + input_ids.size(1)]  # 获取对应区间范围的旋转位置编码；考虑了起始位置 start_pos，支持增量解码场景
         past_kvs = []
         for l, layer in enumerate(self.layers):
             h, past_kv = layer(
                 h, pos_cis,
-                past_key_value=past_key_values[l],
+                past_key_value=past_key_values[l],  # 对应层过去的KV Cache，用于加速计算
                 use_cache=use_cache
             )
-            past_kvs.append(past_kv)
+            past_kvs.append(past_kv)  # 将每个层的past_kv缓存起来
 
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.output(self.norm(h)[:, slice_indices, :])
-        aux_loss = sum(l.feed_forward.aux_loss for l in self.layers if isinstance(l.feed_forward, MOEFeedForward))
-        self.OUT.__setitem__('last_hidden_state', h)
-        self.OUT.__setitem__('logits', logits)
-        self.OUT.__setitem__('aux_loss', aux_loss)
-        self.OUT.__setitem__('past_key_values', past_kvs)
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep  # 如果logits_to_keep是int，则取最后logits_to_keep个token，否则取所有token
+        logits = self.output(self.norm(h)[:, slice_indices, :])  # 计算logits，shape为[bsz, seq_len, vocab_size]
+        aux_loss = sum(l.feed_forward.aux_loss for l in self.layers if isinstance(l.feed_forward, MOEFeedForward))  # 计算辅助损失
+        self.OUT.__setitem__('last_hidden_state', h)  # 记录last_hidden_state
+        self.OUT.__setitem__('logits', logits)  # 记录logits
+        self.OUT.__setitem__('aux_loss', aux_loss)  # 记录辅助损失
+        self.OUT.__setitem__('past_key_values', past_kvs)  # 记录past_key_values
         return self.OUT
 
     @torch.inference_mode()
@@ -344,48 +344,48 @@ class MiniMindLM(PreTrainedModel):
 
         # 直接生成
         generated = []
-        for i in range(input_ids.size(0)):
-            non_pad = input_ids[i][input_ids[i] != pad_token_id].unsqueeze(0)
-            for _ in range(num_return_sequences):
+        for i in range(input_ids.size(0)):  # 遍历batch中的每个样本
+            non_pad = input_ids[i][input_ids[i] != pad_token_id].unsqueeze(0)  # 去除填充部分，获取真实序列
+            for _ in range(num_return_sequences):  # 对每个样本生成num_return_sequences个序列
                 out = self._stream(non_pad, eos_token_id, max_new_tokens, temperature, top_p, rp, use_cache, **args)
                 tokens_list = [tokens[:, -1:] for tokens in out]
                 gen = torch.cat(tokens_list, dim=-1) if tokens_list else non_pad
-                full_sequence = torch.cat([non_pad, gen], dim=-1)
-                generated.append(full_sequence)
+                full_sequence = torch.cat([non_pad, gen], dim=-1)  # 将原始序列和生成的序列拼接起来
+                generated.append(full_sequence)  # 将完整的序列添加到generated列表中
 
-        max_length = max(seq.size(1) for seq in generated)
+        max_length = max(seq.size(1) for seq in generated)  # 获取所有生成序列的最大长度
         generated = [
             torch.cat(
                 [seq, torch.full((1, max_length - seq.size(1)), pad_token_id, dtype=seq.dtype, device=seq.device)],
                 dim=-1)
             for seq in generated
-        ]
-        output = torch.cat(generated, dim=0)
-        res = output.view(input_ids.size(0) * num_return_sequences, -1)
+        ]  # 将所有生成序列填充到最大长度
+        output = torch.cat(generated, dim=0)  # # 将所有序列拼接成一个batch
+        res = output.view(input_ids.size(0) * num_return_sequences, -1)  # 重塑为(batch_size * num_return_sequences, seq_length)的形状
         return res
 
     def _stream(self, input_ids, eos_token_id, max_new_tokens, temperature, top_p, rp, use_cache, **args):
-        start, first_seq, past_kvs = input_ids.shape[1], True, None
-        while input_ids.shape[1] < max_new_tokens - 1:
-            if first_seq or not use_cache:
+        start, first_seq, past_kvs = input_ids.shape[1], True, None  # 初始化起始位置、首次序列标志和KV缓存
+        while input_ids.shape[1] < max_new_tokens - 1:  # 循环生成，直到达到最大token数或生成结束标记
+            if first_seq or not use_cache:  # 如果是首次生成，或者不使用缓存，则直接生成
                 out, first_seq = self(input_ids, past_key_values=past_kvs, use_cache=use_cache, **args), False
-            else:
+            else:  # 增量前向传播，只处理最后生成的一个token，利用KV缓存
                 out = self(input_ids[:, -1:], past_key_values=past_kvs, use_cache=use_cache,
                            start_pos=input_ids.shape[1] - 1, **args)
-            logits, past_kvs = out.logits[:, -1, :], out.past_key_values
-            logits[:, list(set(input_ids.tolist()[0]))] /= rp
-            logits /= (temperature + 1e-9)
-            if top_p is not None and top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+            logits, past_kvs = out.logits[:, -1, :], out.past_key_values  # 获取新推理出的logits最后一位和对应的KV缓存
+            logits[:, list(set(input_ids.tolist()[0]))] /= rp  # 重复惩罚：降低已生成token的概率，避免重复
+            logits /= (temperature + 1e-9)  # 温度采样：调整分布的锐度，temperature越小，分布越陡峭，采样越确定
+            if top_p is not None and top_p < 1.0:  # 核采样(Top-p)：只保留累积概率达到top_p的最高概率token
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)  # 按概率降序排列logits
                 sorted_probs = F.softmax(sorted_logits, dim=-1)
-                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
-                sorted_indices_to_remove[:, 0] = False
-                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                logits[indices_to_remove] = -float('Inf')
-            input_ids_next = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
-            input_ids = torch.cat((input_ids, input_ids_next), dim=1)
-            yield input_ids[:, start:]
-            if input_ids_next.item() == eos_token_id:
+                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)  # 计算累积概率
+                sorted_indices_to_remove = cumulative_probs > top_p  # 确定哪些token需要被移除
+                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()  # 将移除标志向右移动一位
+                sorted_indices_to_remove[:, 0] = False  # 确保第一个token不被移除
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)  # 将移除标志应用到logits上
+                logits[indices_to_remove] = -float('Inf')  # 将被过滤的位置设为负无穷，使其在采样时概率为0
+            input_ids_next = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)  # 多项式采样：根据概率分布随机选择下一个token
+            input_ids = torch.cat((input_ids, input_ids_next), dim=1)  # 将新token添加到input_ids中
+            yield input_ids[:, start:]  # 使用yield返回当前生成结果，实现流式输出
+            if input_ids_next.item() == eos_token_id:  # 如果生成的token是结束标记，则停止生成
                 break
